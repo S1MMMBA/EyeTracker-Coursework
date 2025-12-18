@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import math
 import time
-import json
+import hashlib
 from collections import deque, Counter
 from typing import List, Tuple, Dict, Any
 import matplotlib.pyplot as plt
@@ -35,8 +35,8 @@ class AdvancedGazeTracker:
         # self.gaze_history = deque(maxlen=30)  # краткая история для вычисления движения
         # self.eye_state_history = deque(maxlen=50)
 
-        self.movement_events = deque()  # ограниченная история движений
-        self.gaze_history = deque()  # краткая история для вычисления движения
+        self.movement_events = deque()
+        self.gaze_history = deque()
         self.eye_state_history = deque()
         
         # Статистика
@@ -472,48 +472,49 @@ class MovementBasedCryptoGenerator:
         bits = []
         attempts = 0
         max_attempts = 50
+        byte_to_gen_key = bytearray()  
+        while len(bits) < num_bits and attempts < max_attempts:
+            new_bits = self.extract_movement_entropy()
+            if new_bits:
+                bits.extend(new_bits)
+        
+            attempts += 1
+        
+            if len(bits) < num_bits:
+                time.sleep(0.1)
+                  
         with open("newbits_data.bin", "wb") as f:
-            while len(bits) < num_bits and attempts < max_attempts:
-                new_bits = self.extract_movement_entropy()
-                if new_bits:
-                    bits.extend(new_bits)
-
-                for i in range(0, len(new_bits), 8):
-                    chunk = new_bits[i:i+8]
-                    if len(chunk) == 8:
-                        byte_value = int(''.join(map(str, chunk)), 2)
-                        f.write(bytes([byte_value]))
-
-                attempts += 1
-                
-                # Короткая пауза для накопления новых движений
-                if len(bits) < num_bits:
-                    time.sleep(0.1)
-
-
-        final_bits = bits[:num_bits]
+            # Записываем все биты как байты
+            for i in range(0, len(bits), 8):
+                chunk = bits[i:i+8]
+                if len(chunk) == 8:
+                    byte_value = int(''.join(map(str, chunk)), 2)
+                    f.write(bytes([byte_value]))
+                else:
+                    # Дополняем последний неполный байт нулями
+                    incomplete_byte = chunk + [0] * (8 - len(chunk))
+                    byte_value = int(''.join(map(str, incomplete_byte)), 2)
+                    byte_to_gen_key.append(byte_value)
+                    f.write(byte_to_gen_key)
         
-        # Проверка качества
-        if final_bits:
-            ones = sum(final_bits)
-            proportion = ones / len(final_bits)
-            print(f" Сгенерировано {len(final_bits)} битов (баланс: {proportion:.3f})")
-            print(f" Массивы new_bits сохранены в newbits_data.bin")
+        sha256_hash = hashlib.sha256(byte_to_gen_key).digest()
+        num_bytes = num_bits // 8
+        final_key = sha256_hash[:num_bytes]
         
-        return final_bits
+        return final_key
     
-    def bits_to_bytes(self, bits):
-        """Преобразование битов в байты"""
-        if len(bits) % 8 != 0:
-            bits = bits[:-(len(bits) % 8)]  # Обрезаем до кратного 8
+    # def bits_to_bytes(self, bits):
+    #     """Преобразование битов в байты"""
+    #     if len(bits) % 8 != 0:
+    #         bits = bits[:-(len(bits) % 8)]  # Обрезаем до кратного 8
         
-        byte_array = bytearray()
-        for i in range(0, len(bits), 8):
-            byte_bits = bits[i:i+8]
-            byte_value = int(''.join(map(str, byte_bits)), 2)
-            byte_array.append(byte_value)
+    #     byte_array = bytearray()
+    #     for i in range(0, len(bits), 8):
+    #         byte_bits = bits[i:i+8]
+    #         byte_value = int(''.join(map(str, byte_bits)), 2)
+    #         byte_array.append(byte_value)
         
-        return bytes(byte_array)
+    #     return bytes(byte_array)
 
 
 def main():
@@ -569,39 +570,26 @@ def main():
                 print(f"   Качество данных: {stats['data_quality']:.1f}%")
                 print(f"   Средняя величина движения: {stats['avg_movement_magnitude']:.1f}px")
             elif key == ord('b'):
-                print("\n Генерация 128 случайных битов...")
-                bits = crypto_generator.generate_secure_bits(128)
-                if bits:
-                    # Простая проверка случайности
-                    ones = sum(bits)
-                    proportion = ones / len(bits)
-                    print(f" Сгенерировано {len(bits)} битов")
-                    print(f"   Баланс: {ones}/1, {len(bits)-ones}/0 ({proportion:.3f})")
-                    
+                print("\n Генерация 128 битного ключа...")
+                key = crypto_generator.generate_secure_bits(128)
+                if key and len(key) == 16:
                     # Сохранение битов
-                    with open("random_bits.txt", "w") as f:
-                        f.write(''.join(map(str, bits)))
-                    print("   Биты сохранены в random_bits.txt")
+                    with open("eye_crypto_key_128.bin", "wb") as f:
+                        f.write(key)
+                    print("Ключ сохранен в eye_crypto_key_128.bin")
                 else:
-                    print(" Не удалось сгенерировать биты")
+                    print(" Не удалось сгенерировать ключ")
             elif key == ord('k'):
                 print("\n Генерация криптографического ключа 256 бит...")
-                bits = crypto_generator.generate_secure_bits(256)
-                if bits and len(bits) == 256:
-                    key_bytes = crypto_generator.bits_to_bytes(bits)
+                key = crypto_generator.generate_secure_bits(256)
+                if key and len(key) == 32:  
+                    with open("eye_crypto_key_256.bin", "wb") as f:
+                        f.write(key)
                     
-                    with open("eye_crypto_key.bin", "wb") as f:
-                        f.write(key_bytes)
-                    
-                    print(f" Ключ сохранен: {len(key_bytes)} байт")
-                    print(f" HEX: {key_bytes.hex()[:32]}...")
-                    
-                    # Проверка случайности
-                    ones = sum(bits)
-                    proportion = ones / len(bits)
-                    print(f"   Баланс битов: {proportion:.3f} (идеально 0.5)")
+                    print(f" Ключ сохранен: {len(key)} байт")
+                    print(f" HEX: {key.hex()[:32]}...")
                 else:
-                    print(f" Не удалось сгенерировать ключ ({len(bits) if bits else 0}/256 бит)")
+                    print(f" Не удалось сгенерировать ключ (256 бит)")
             elif key == ord('r'):
                 tracker.movement_events.clear()
                 tracker.gaze_history.clear()
@@ -630,12 +618,12 @@ def main():
         
         if stats['movement_count'] >= 50:
             print("\n Автоматическая генерация финального ключа...")
-            bits = crypto_generator.generate_secure_bits(256)
-            if bits and len(bits) == 256:
-                key_bytes = crypto_generator.bits_to_bytes(bits)
-                with open("final_eye_key.bin", "wb") as f:
-                    f.write(key_bytes)
-                print(f" Финальный ключ сохранен: {len(key_bytes)} байт")
+            key = crypto_generator.generate_secure_bits(256)
+            if key and len(key) == 32:
+                #key_bytes = crypto_generator.bits_to_bytes(bits)
+                with open("final_eye_key_256.bin", "wb") as f:
+                    f.write(key)
+                print(f" Финальный ключ сохранен: {len(key)} байт")
 
 
 if __name__ == "__main__":
