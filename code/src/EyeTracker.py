@@ -26,8 +26,8 @@ class AdvancedGazeTracker:
         self._initialize_mediapipe()
         
         # Параметры трекинга
-        self.movement_threshold = 15  # пикселей для детекции движения 15
-        self.min_movement_interval = 0.05  # минимальный интервал между движениями 0.15
+        self.movement_threshold = 5  # пикселей для детекции движения 15
+        self.min_movement_interval = 0.01  # минимальный интервал между движениями 0.15
         self.eye_openness_threshold = 0.4  # порог открытости глаз 0.4
         
         # Хранилище данных (ТОЛЬКО движения)
@@ -482,8 +482,10 @@ class MovementBasedCryptoGenerator:
         
             if len(bits) < num_bits:
                 time.sleep(0.1)
-                  
-        with open("newbits_data.bin", "wb") as f:
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = f"D:/university/Coursework sem 7/row_bites/newbits_data_{timestamp}.bin"    
+        with open(filepath, "wb") as f:
             # Записываем все биты как байты
             for i in range(0, len(bits), 8):
                 chunk = bits[i:i+8]
