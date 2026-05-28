@@ -1468,9 +1468,9 @@ class EyeTrackerUI(QMainWindow):
         media_split_layout.addWidget(self.video_widget)
         
         # Аудио виджет
-        audio_widget = QWidget()
-        audio_widget.setMinimumSize(400, 300)
-        audio_layout = QVBoxLayout(audio_widget)
+        self.audio_widget_container = QWidget()
+        self.audio_widget_container.setMinimumSize(400, 300)
+        audio_layout = QVBoxLayout(self.audio_widget_container)
         audio_layout.setContentsMargins(0, 0, 0, 0)
         audio_layout.setSpacing(5)
         
@@ -1480,7 +1480,7 @@ class EyeTrackerUI(QMainWindow):
         
         audio_layout.addWidget(self.audio_visualizer)
         
-        media_split_layout.addWidget(audio_widget)
+        media_split_layout.addWidget(self.audio_widget_container)
         
         media_card.addWidget(media_split_layout)
         center_layout.addWidget(media_card)
@@ -1635,28 +1635,53 @@ class EyeTrackerUI(QMainWindow):
             f"font-size: 11px; color: {color}; font-weight: 600;"
         )
 
+        show_eye   = self._entropy_source in ("eye",   "both")
+        show_voice = self._entropy_source in ("voice", "both")
+
+        # Камера и статистика взгляда
+        self.video_widget.setVisible(show_eye)
+        self.stats_widget.setVisible(show_eye)
+
+        # Аудио визуализация и статистика звука
+        self.audio_widget_container.setVisible(show_voice)
+        self.audio_stats_widget.setVisible(show_voice)
+
     def start_tracking(self):
-        self.video_widget.hide_placeholder()
-        self.video_widget.show_loading()
-        
-        self.camera_thread.start()
+        show_eye   = self._entropy_source in ("eye",   "both")
+        show_voice = self._entropy_source in ("voice", "both")
+
+        if show_eye:
+            self.video_widget.hide_placeholder()
+            self.video_widget.show_loading()
+            self.camera_thread.start()
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.status_label.setText("🎯 Запуск камеры...")
+
+        status_text = "🎯 Запуск камеры..." if show_eye else "🎤 Запись голоса..."
+        self.status_label.setText(status_text)
         self.status_label.setStyleSheet("""
             font-size: 14px; font-weight: 500; color: #64B5F6;
             padding: 12px; background-color: #1A2A3A; border-radius: 8px;
         """)
-        
+
         # Блокируем тумблер во время трекинга
         self.source_toggle.setEnabled(False)
 
-        if self._entropy_source in ("voice", "both"):
+        if show_voice:
             self.audio_visualizer.start_recording()
             self.audio_stats_widget.start_monitoring()
     
     def stop_tracking(self):
-        self.camera_thread.stop()
+        show_eye   = self._entropy_source in ("eye",   "both")
+        show_voice = self._entropy_source in ("voice", "both")
+
+        if show_eye:
+            self.camera_thread.stop()
+            self.video_widget.show_placeholder()
+            self.video_widget.first_frame_received = False
+            self.video_widget.is_camera_active = False
+
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("⏸ Трекинг остановлен")
@@ -1664,18 +1689,14 @@ class EyeTrackerUI(QMainWindow):
             font-size: 14px; font-weight: 500; color: #c0c0c0;
             padding: 12px; background-color: #3a3a3a; border-radius: 8px;
         """)
-        
-        self.video_widget.show_placeholder()
-        self.video_widget.first_frame_received = False
-        self.video_widget.is_camera_active = False
-        
-        if self._entropy_source in ("voice", "both"):
+
+        if show_voice:
             self.audio_visualizer.stop_recording()
             self.audio_stats_widget.stop_monitoring()
 
         # Разблокируем тумблер
         self.source_toggle.setEnabled(True)
-        
+
         if self.star_field.is_active:
             self.triggers_toggle.state = False
             self.triggers_toggle.update()
@@ -1689,22 +1710,27 @@ class EyeTrackerUI(QMainWindow):
         self.status_label.setText("🔄 Данные сброшены")
     
     def generate_key(self, bits: int):
-        if not self.camera_thread.isRunning():
+        use_eye   = self._entropy_source in ("eye",   "both")
+        use_voice = self._entropy_source in ("voice", "both")
+
+        if not self.camera_thread.isRunning() and not use_voice:
             QMessageBox.warning(self, "Предупреждение", "Сначала запустите трекинг!")
             return
-        
-        stats = self.camera_thread.tracker.get_movement_statistics()
-        if stats['movement_count'] < 20:
-            QMessageBox.warning(self, "Недостаточно данных", 
-                f"Необходимо минимум 20 движений, сейчас: {stats['movement_count']}")
+        if use_eye and not self.camera_thread.isRunning():
+            QMessageBox.warning(self, "Предупреждение", "Камера не запущена. Запустите трекинг!")
             return
+
+        if use_eye:
+            stats = self.camera_thread.tracker.get_movement_statistics()
+            if stats['movement_count'] < 20:
+                QMessageBox.warning(self, "Недостаточно данных",
+                    f"Необходимо минимум 20 движений, сейчас: {stats['movement_count']}")
+                return
 
         from VoiceEntropy import derive_key, combine_entropy
 
         # ── Собираем данные согласно выбранному режиму источников ─────────
         voice_collector = self.audio_visualizer.voice_collector
-        use_eye   = self._entropy_source in ("eye",   "both")
-        use_voice = self._entropy_source in ("voice", "both")
 
         # Глазные байты
         if use_eye:
@@ -1745,21 +1771,22 @@ class EyeTrackerUI(QMainWindow):
             return
 
         # ── Проверка минимального размера пула (SP800-90B калибровка) ────────
-        min_bytes = MIN_POOL_BYTES_128 if bits == 128 else MIN_POOL_BYTES_256
-        if len(raw_pool) < min_bytes:
-            needed   = min_bytes - len(raw_pool)
-            QMessageBox.warning(
-                self, "Недостаточно энтропии",
-                f"Пул слишком мал для надёжной генерации {bits}-бит ключа.\n\n"
-                f"Накоплено:    {len(raw_pool)} байт\n"
-                f"Необходимо:  {min_bytes} байт "
-                f"(на основе SP800-90B, H_min = {H_MIN_BITS_PER_BYTE} бит/байт)\n"
-                f"Не хватает:  {needed} байт\n\n"
-                f"Продолжайте двигать глазами"
-                + (" и говорить" if self._entropy_source in ("voice", "both") else "")
-                + "."
-            )
-            return
+        # Для режима «только взгляд» проверка снята — объём пула
+        # определяется количеством движений, которое уже проверено выше.
+        if self._entropy_source != "eye":
+            min_bytes = MIN_POOL_BYTES_128 if bits == 128 else MIN_POOL_BYTES_256
+            if len(raw_pool) < min_bytes:
+                needed = min_bytes - len(raw_pool)
+                QMessageBox.warning(
+                    self, "Недостаточно энтропии",
+                    f"Пул слишком мал для надёжной генерации {bits}-бит ключа.\n\n"
+                    f"Накоплено:    {len(raw_pool)} байт\n"
+                    f"Необходимо:  {min_bytes} байт "
+                    f"(на основе SP800-90B, H_min = {H_MIN_BITS_PER_BYTE} бит/байт)\n"
+                    f"Не хватает:  {needed} байт\n\n"
+                    f"Продолжайте говорить."
+                )
+                return
 
         key = derive_key(raw_pool, bits) if raw_pool else b""
 

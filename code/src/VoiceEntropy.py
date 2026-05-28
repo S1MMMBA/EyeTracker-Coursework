@@ -359,6 +359,16 @@ class VoiceEntropyCollector:
                 byte_val = sum(b << i for i, b in enumerate(byte_bits))
                 self._entropy_pool.append(byte_val)
 
+        # ── Обновление качества энтропии ──────────────────────────────────
+        # voice_ratio: доля фреймов с реальным голосом (0.0–1.0)
+        # pool_fill:   заполненность пула относительно 200 байт-цели
+        # Итог: среднее двух метрик, выражается как 0.0–1.0
+        if self._frame_count > 0:
+            voice_ratio = self._active_frames / self._frame_count
+            with self._lock:
+                pool_fill = min(1.0, len(self._entropy_pool) / 200.0)
+            self._entropy_quality = (voice_ratio + pool_fill) / 2.0
+
 
     # ── Получение данных ──────────────────────────────────────────────────────
 
