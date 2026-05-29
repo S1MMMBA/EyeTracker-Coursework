@@ -15,6 +15,7 @@ import subprocess
 from EyeTracker import (
     AdvancedGazeTracker,
     MovementBasedCryptoGenerator,
+    MIN_EYE_MOVEMENTS_PER_KEY,
     MEDIAPIPE_AVAILABLE,
     MEDIAPIPE_IMPORT_ERROR,
 )
@@ -23,6 +24,7 @@ from EyeTracker import (
 from VoiceEntropy import (
     VoiceEntropyCollector,
     generate_combined_key,
+    MIN_FRAMES,
     SOUNDDEVICE_AVAILABLE,
 )
 
@@ -511,6 +513,15 @@ class CameraThread(QThread):
     
     def generate_key(self, bits: int = 256):
         return self.crypto_generator.generate_secure_bits(bits)
+
+    def available_movement_count(self) -> int:
+        return self.crypto_generator.available_movement_count()
+
+    def get_entropy_snapshot(self):
+        return self.crypto_generator.get_available_entropy_snapshot()
+
+    def consume_entropy_until(self, movement_count: int):
+        self.crypto_generator.consume_entropy_until(movement_count)
     
     def reset_data(self):
         self.tracker.movement_events.clear()
@@ -520,6 +531,7 @@ class CameraThread(QThread):
         self.tracker.last_movement_time = 0
         self.tracker.last_valid_gaze = None
         self.tracker.frame_count = 0
+        self.crypto_generator.reset()
 
 
 class StarWidget(QWidget):
@@ -1260,6 +1272,9 @@ class AudioStatisticsWidget(QWidget):
         quality  = stats.get("entropy_quality", 0.0)
         is_active = stats.get("is_active", False)
         pool_bytes = stats.get("pool_bytes", 0)
+        available_pool_bytes = stats.get("available_pool_bytes", pool_bytes)
+        available_frames = stats.get("available_frames", 0)
+        available_active_frames = stats.get("available_active_frames", 0)
 
         self.metrics["volume_avg"].setText(f"{avg_db:.1f} dB")
         self.metrics["freq_main"].setText(f"{freq:.0f} Hz")
@@ -1268,18 +1283,22 @@ class AudioStatisticsWidget(QWidget):
         self.quality_bar.setValue(int(quality))
         self.quality_value.setText(f"{int(quality)}%")
 
-        self.pool_label.setText(f"Пул: {pool_bytes} байт")
+        self.pool_label.setText(
+            f"Пул: {pool_bytes} байт, новых: {available_pool_bytes} байт"
+        )
 
-        # Процент тишины и цветовая индикация порога 40%
-        if self._collector.has_enough_entropy():
-            silence_pct = self._collector.silence_percent() * 100
-            voice_ok    = self._collector.has_enough_voice_activity()
+        # Процент тишины в новом сегменте после последнего ключа.
+        if available_frames >= MIN_FRAMES:
+            silence_pct = (
+                (available_frames - available_active_frames) / available_frames
+            ) * 100
+            voice_ok = silence_pct <= 40.0
             color  = "#4CAF50" if voice_ok else "#FF5722"
             status = "✓ голос учитывается" if voice_ok else "✗ голос отброшен"
             self.silence_label.setText(f"Тишина: {silence_pct:.1f}%  {status}")
             self.silence_label.setStyleSheet(f"font-size: 10px; color: {color};")
         else:
-            self.silence_label.setText("Тишина: накапливаются данные…")
+            self.silence_label.setText("Тишина: накапливаются новые данные…")
             self.silence_label.setStyleSheet("font-size: 10px; color: #666;")
 
         if is_active:
@@ -1325,6 +1344,7 @@ class EyeTrackerUI(QMainWindow):
         self.camera_thread = CameraThread()
         self.last_generated_key = None
         self.last_raw_pool = None
+        self.generated_key_fingerprints = set()
         self.gaze_points = deque(maxlen=1000)
         
         self.star_field = StarField(self)
@@ -1518,7 +1538,7 @@ class EyeTrackerUI(QMainWindow):
         self.copy_key_btn.setFixedHeight(36)
         key_info_layout.addWidget(self.copy_key_btn)
 
-        self.save_pool_btn = IconButton("⬇", "Скачать пул энтропии (.bin)")
+        self.save_pool_btn = IconButton("⬇", "Скачать пул последнего ключа (.bin)")
         self.save_pool_btn.setEnabled(False)
         self.save_pool_btn.setFixedHeight(36)
         key_info_layout.addWidget(self.save_pool_btn)
@@ -1654,6 +1674,8 @@ class EyeTrackerUI(QMainWindow):
         self.audio_widget_container.setVisible(show_voice)
         self.audio_stats_widget.setVisible(show_voice)
 
+        self._clear_generated_key()
+
     def start_tracking(self):
         show_eye   = self._entropy_source in ("eye",   "both")
         show_voice = self._entropy_source in ("voice", "both")
@@ -1715,7 +1737,18 @@ class EyeTrackerUI(QMainWindow):
         self.gaze_points.clear()
         self.audio_visualizer.reset()
         self.audio_stats_widget.reset()
+        self._clear_generated_key()
         self.status_label.setText("🔄 Данные сброшены")
+
+    def _clear_generated_key(self):
+        """Очищает отображение ключа и снимок пула последней генерации."""
+        self.last_generated_key = None
+        self.last_raw_pool = None
+        self.key_display.clear()
+        self.key_size_label.setText("Размер: —")
+        self.save_btn.setEnabled(False)
+        self.copy_key_btn.setEnabled(False)
+        self.save_pool_btn.setEnabled(False)
     
     def generate_key(self, bits: int):
         use_eye   = self._entropy_source in ("eye",   "both")
@@ -1729,40 +1762,74 @@ class EyeTrackerUI(QMainWindow):
             return
 
         if use_eye:
-            stats = self.camera_thread.tracker.get_movement_statistics()
-            if stats['movement_count'] < 20:
+            new_movement_count = self.camera_thread.available_movement_count()
+            if new_movement_count < MIN_EYE_MOVEMENTS_PER_KEY:
                 QMessageBox.warning(self, "Недостаточно данных",
-                    f"Необходимо минимум 20 движений, сейчас: {stats['movement_count']}")
+                    f"Необходимо минимум {MIN_EYE_MOVEMENTS_PER_KEY} новых движений, "
+                    f"сейчас: {new_movement_count}")
                 return
 
         from VoiceEntropy import derive_key, combine_entropy
 
         # ── Собираем данные согласно выбранному режиму источников ─────────
         voice_collector = self.audio_visualizer.voice_collector
+        source_info = ""
 
         # Глазные байты
         if use_eye:
-            eye_key_bytes = self.camera_thread.generate_key(bits)
-            eye_bytes = eye_key_bytes if eye_key_bytes else b""
+            eye_bytes, eye_end_index, eye_movement_count = \
+                self.camera_thread.get_entropy_snapshot()
         else:
             eye_bytes = b""
+            eye_end_index = None
+            eye_movement_count = 0
 
         # Голосовые байты — только если режим включает голос
         # и микрофон реально работал с достаточной активностью
         if use_voice:
-            mic_ok      = voice_collector.microphone_active()
-            voice_ok    = mic_ok and voice_collector.has_enough_voice_activity()
-            voice_bytes = voice_collector.get_entropy_bytes() if voice_ok else b""
+            mic_ok = voice_collector.microphone_active()
+            voice_snapshot = voice_collector.get_available_entropy_snapshot()
+            voice_frame_count = voice_snapshot["frame_count"]
+            voice_active_frames = voice_snapshot["active_frames"]
+            voice_silence_pct = 1.0
+            if voice_frame_count > 0:
+                voice_silence_pct = (
+                    (voice_frame_count - voice_active_frames) / voice_frame_count
+                )
+            voice_ok = (
+                mic_ok
+                and voice_frame_count >= MIN_FRAMES
+                and voice_silence_pct <= 0.40
+            )
+            if voice_ok:
+                voice_bytes = voice_snapshot["bytes"]
+                voice_end_index = voice_snapshot["pool_end"]
+                voice_frame_end = voice_snapshot["frame_end"]
+                voice_active_end = voice_snapshot["active_end"]
+            else:
+                voice_bytes = b""
+                voice_end_index = None
+                voice_frame_end = None
+                voice_active_end = None
 
             if not mic_ok:
                 source_info = " [микрофон недоступен]"
                 use_voice = False
+            elif voice_frame_count < MIN_FRAMES:
+                source_info = (
+                    f" [голос отброшен — новых фреймов "
+                    f"{voice_frame_count}/{MIN_FRAMES}]"
+                )
+                use_voice = False
             elif not voice_ok:
-                silence_pct = int(voice_collector.silence_percent() * 100)
+                silence_pct = int(voice_silence_pct * 100)
                 source_info = f" [голос отброшен — тишина {silence_pct}% > 40%]"
                 use_voice = False
         else:
             voice_bytes = b""
+            voice_end_index = None
+            voice_frame_end = None
+            voice_active_end = None
 
         # ── Строим raw_pool из доступных источников ───────────────────────
         if use_eye and use_voice and eye_bytes and voice_bytes:
@@ -1770,46 +1837,70 @@ class EyeTrackerUI(QMainWindow):
             source_info = " [👁+🎤]"
         elif use_eye and eye_bytes:
             raw_pool    = eye_bytes
-            source_info = " [👁]" if self._entropy_source == "eye" else " [👁 — голос недоступен]"
+            source_info = (
+                " [👁]"
+                if self._entropy_source == "eye"
+                else " [👁 — голос недоступен]"
+            )
         elif use_voice and voice_bytes:
             raw_pool    = voice_bytes
             source_info = " [🎤]"
         else:
-            QMessageBox.critical(self, "Ошибка", "Нет данных от выбранных источников")
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Нет данных от выбранных источников{source_info}"
+            )
             return
 
         # ── Проверка минимального размера пула (SP800-90B калибровка) ────────
-        # Для режима «только взгляд» проверка снята — объём пула
-        # определяется количеством движений, которое уже проверено выше.
-        if self._entropy_source != "eye":
-            min_bytes = MIN_POOL_BYTES_128 if bits == 128 else MIN_POOL_BYTES_256
-            if len(raw_pool) < min_bytes:
-                needed = min_bytes - len(raw_pool)
-                QMessageBox.warning(
-                    self, "Недостаточно энтропии",
-                    f"Пул слишком мал для надёжной генерации {bits}-бит ключа.\n\n"
-                    f"Накоплено:    {len(raw_pool)} байт\n"
-                    f"Необходимо:  {min_bytes} байт "
-                    f"(на основе SP800-90B, H_min = {H_MIN_BITS_PER_BYTE} бит/байт)\n"
-                    f"Не хватает:  {needed} байт\n\n"
-                    f"Продолжайте говорить."
-                )
-                return
+        min_bytes = MIN_POOL_BYTES_128 if bits == 128 else MIN_POOL_BYTES_256
+        if len(raw_pool) < min_bytes:
+            needed = min_bytes - len(raw_pool)
+            QMessageBox.warning(
+                self, "Недостаточно энтропии",
+                f"Свежий пул слишком мал для надёжной генерации {bits}-бит ключа.\n\n"
+                f"Накоплено новых байт: {len(raw_pool)}\n"
+                f"Необходимо:          {min_bytes} байт "
+                f"(на основе SP800-90B, H_min = {H_MIN_BITS_PER_BYTE} бит/байт)\n"
+                f"Не хватает:          {needed} байт\n\n"
+                f"Продолжайте сбор данных."
+            )
+            return
 
         key = derive_key(raw_pool, bits) if raw_pool else b""
 
         if key and len(key) > 0:
+            if key in self.generated_key_fingerprints:
+                QMessageBox.critical(
+                    self, "Повтор ключа",
+                    "Такой ключ уже был сгенерирован в текущей сессии. "
+                    "Продолжайте сбор новых данных."
+                )
+                return
+
+            if use_eye and eye_bytes and eye_end_index is not None:
+                self.camera_thread.consume_entropy_until(eye_end_index)
+            if use_voice and voice_bytes and voice_end_index is not None:
+                voice_collector.consume_entropy_until(
+                    voice_end_index, voice_frame_end, voice_active_end
+                )
+
+            self.generated_key_fingerprints.add(key)
             self.last_generated_key = key
             self.last_raw_pool = raw_pool
             hex_key = key.hex()
 
             self.key_display.setText(hex_key)
-            self.key_size_label.setText(f"Размер: {len(key)} байт ({bits} бит){source_info}")
+            self.key_size_label.setText(
+                f"Размер: {len(key)} байт ({bits} бит){source_info}; "
+                f"пул: {len(raw_pool)} байт"
+            )
             self.save_btn.setEnabled(True)
             self.copy_key_btn.setEnabled(True)
             self.save_pool_btn.setEnabled(True)
             
-            filename = f"eye_voice_key_{bits}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"eye_voice_key_{bits}_{timestamp}.bin"
             with open(filename, "wb") as f:
                 f.write(key)
             
@@ -1826,10 +1917,11 @@ class EyeTrackerUI(QMainWindow):
     def save_key(self):
         if not self.last_generated_key:
             return
-        
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename, _ = QFileDialog.getSaveFileName(
             self, "Сохранить ключ",
-            f"eye_key_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin",
+            f"eye_key_{timestamp}.bin",
             "Binary Files (*.bin)"
         )
         
@@ -1842,9 +1934,10 @@ class EyeTrackerUI(QMainWindow):
         if not self.last_raw_pool:
             return
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить сырой пул энтропии",
-            f"entropy_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin",
+            self, "Сохранить сырой пул последнего ключа",
+            f"entropy_pool_{timestamp}.bin",
             "Binary Files (*.bin)"
         )
 
@@ -1853,7 +1946,8 @@ class EyeTrackerUI(QMainWindow):
                 f.write(self.last_raw_pool)
             QMessageBox.information(
                 self, "Сохранено",
-                f"Пул энтропии сохранён:\n{filename}\nРазмер: {len(self.last_raw_pool)} байт"
+                f"Пул последнего ключа сохранён:\n{filename}\n"
+                f"Размер: {len(self.last_raw_pool)} байт"
             )
 
     def handle_error(self, error_msg: str):

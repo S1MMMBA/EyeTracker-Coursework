@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
 
+MIN_EYE_MOVEMENTS_PER_KEY = 20
+
 try:
     import mediapipe as mp
     mp.solutions.face_mesh.FaceMesh
@@ -398,17 +400,48 @@ class MovementBasedCryptoGenerator:
     def __init__(self, tracker):
         self.tracker = tracker
         self.entropy_pool = deque(maxlen=1000)
+        self._consumed_movement_count = 0
+
+    def reset(self):
+        """Сбрасывает отметку уже использованных событий движения."""
+        self._consumed_movement_count = 0
+
+    def available_movement_count(self) -> int:
+        """Возвращает число новых движений, не использованных для ключа."""
+        return max(0, len(self.tracker.movement_events) - self._consumed_movement_count)
+
+    def _movement_snapshot(self) -> Tuple[List[Dict[str, Any]], int]:
+        """Возвращает стабильный снимок новых движений и конечный индекс."""
+        events = list(self.tracker.movement_events)
+        start = min(self._consumed_movement_count, len(events))
+        return events[start:], len(events)
+
+    def consume_entropy_until(self, movement_count: int):
+        """Помечает движения до movement_count как использованные."""
+        movement_count = max(0, min(movement_count, len(self.tracker.movement_events)))
+        self._consumed_movement_count = max(self._consumed_movement_count, movement_count)
+
+    def get_available_entropy_snapshot(self) -> Tuple[bytes, int, int]:
+        """
+        Возвращает сырые байты из новых движений, конечный индекс снимка
+        и количество движений в этом снимке. Пул не очищается.
+        """
+        movements, end_index = self._movement_snapshot()
+        bits = self._extract_movement_entropy(movements)
+        return self._bits_to_bytes(bits), end_index, len(movements)
         
     def extract_movement_entropy(self):
         """Извлечение энтропии из движений глаз"""
-        if len(self.tracker.movement_events) < 5:
+        return self._extract_movement_entropy(list(self.tracker.movement_events))
+
+    def _extract_movement_entropy(self, movements: List[Dict[str, Any]]) -> List[int]:
+        """Извлечение энтропии из переданного набора движений глаз."""
+        if len(movements) < 5:
             return []
         
-        # Берем последние движения
-        recent_movements = list(self.tracker.movement_events)[-10:]
         bits = []
         
-        for movement in self.tracker.movement_events:
+        for movement in movements:
             # Извлекаем энтропию из различных параметров движения
             movement_bits = self._extract_movement_bits(movement)
             timing_bits = self._extract_timing_bits(movement)
@@ -486,33 +519,19 @@ class MovementBasedCryptoGenerator:
     
     def generate_secure_bits(self, num_bits=256):
         """Генерация безопасных битов"""
-        movement_count = len(self.tracker.movement_events)
+        key_material, end_index, movement_count = self.get_available_entropy_snapshot()
         
-        if movement_count < 20:
-            print(f" Недостаточно движений: {movement_count}/20")
+        if movement_count < MIN_EYE_MOVEMENTS_PER_KEY:
+            print(f" Недостаточно новых движений: {movement_count}/{MIN_EYE_MOVEMENTS_PER_KEY}")
             return []
         
         print(f" Генерация {num_bits} битов из {movement_count} движений...")
         
-        bits = []
-        attempts = 0
-        max_attempts = 50
-        while len(bits) < num_bits and attempts < max_attempts:
-            new_bits = self.extract_movement_entropy()
-            if new_bits:
-                bits.extend(new_bits)
-        
-            attempts += 1
-        
-            if len(bits) < num_bits:
-                time.sleep(0.1)
-
-        if len(bits) < num_bits:
-            print(f" Не удалось собрать достаточно битов: {len(bits)}/{num_bits}")
+        if len(key_material) * 8 < num_bits:
+            print(f" Не удалось собрать достаточно битов: {len(key_material) * 8}/{num_bits}")
             return []
 
-        key_material = self._bits_to_bytes(bits[:num_bits])
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filepath = Path.cwd() / f"newbits_data_{timestamp}.bin"
         filepath.write_bytes(key_material)
         print(f" Сырые биты сохранены: {filepath}")
@@ -520,6 +539,7 @@ class MovementBasedCryptoGenerator:
         sha256_hash = hashlib.sha256(key_material).digest()
         num_bytes = num_bits // 8
         final_key = sha256_hash[:num_bytes]
+        self.consume_entropy_until(end_index)
         
         return final_key
     
