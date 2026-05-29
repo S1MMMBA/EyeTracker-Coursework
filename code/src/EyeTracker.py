@@ -7,6 +7,7 @@ from collections import deque, Counter
 from typing import List, Tuple, Dict, Any
 import matplotlib.pyplot as plt
 from datetime import datetime
+from pathlib import Path
 
 try:
     import mediapipe as mp
@@ -468,6 +469,20 @@ class MovementBasedCryptoGenerator:
         
         bits.extend(openness_bits + attention_bits)
         return bits
+
+    @staticmethod
+    def _bits_to_bytes(bits: List[int]) -> bytes:
+        """Преобразование битового массива в байты с padding последнего байта."""
+        byte_array = bytearray()
+
+        for i in range(0, len(bits), 8):
+            chunk = bits[i:i + 8]
+            if len(chunk) < 8:
+                chunk = chunk + [0] * (8 - len(chunk))
+
+            byte_array.append(int(''.join(map(str, chunk)), 2))
+
+        return bytes(byte_array)
     
     def generate_secure_bits(self, num_bits=256):
         """Генерация безопасных битов"""
@@ -482,7 +497,6 @@ class MovementBasedCryptoGenerator:
         bits = []
         attempts = 0
         max_attempts = 50
-        byte_to_gen_key = bytearray()  
         while len(bits) < num_bits and attempts < max_attempts:
             new_bits = self.extract_movement_entropy()
             if new_bits:
@@ -493,41 +507,22 @@ class MovementBasedCryptoGenerator:
             if len(bits) < num_bits:
                 time.sleep(0.1)
 
+        if len(bits) < num_bits:
+            print(f" Не удалось собрать достаточно битов: {len(bits)}/{num_bits}")
+            return []
+
+        key_material = self._bits_to_bytes(bits[:num_bits])
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = f"D:/university/Coursework sem 7/row_bites/newbits_data_{timestamp}.bin"    
-        with open(filepath, "wb") as f:
-            # Записываем все биты как байты
-            for i in range(0, len(bits), 8):
-                chunk = bits[i:i+8]
-                if len(chunk) == 8:
-                    byte_value = int(''.join(map(str, chunk)), 2)
-                    f.write(bytes([byte_value]))
-                else:
-                    # Дополняем последний неполный байт нулями
-                    incomplete_byte = chunk + [0] * (8 - len(chunk))
-                    byte_value = int(''.join(map(str, incomplete_byte)), 2)
-                    byte_to_gen_key.append(byte_value)
-                    f.write(byte_to_gen_key)
+        filepath = Path.cwd() / f"newbits_data_{timestamp}.bin"
+        filepath.write_bytes(key_material)
+        print(f" Сырые биты сохранены: {filepath}")
         
-        sha256_hash = hashlib.sha256(byte_to_gen_key).digest()
+        sha256_hash = hashlib.sha256(key_material).digest()
         num_bytes = num_bits // 8
         final_key = sha256_hash[:num_bytes]
         
         return final_key
     
-    # def bits_to_bytes(self, bits):
-    #     """Преобразование битов в байты"""
-    #     if len(bits) % 8 != 0:
-    #         bits = bits[:-(len(bits) % 8)]  # Обрезаем до кратного 8
-        
-    #     byte_array = bytearray()
-    #     for i in range(0, len(bits), 8):
-    #         byte_bits = bits[i:i+8]
-    #         byte_value = int(''.join(map(str, byte_bits)), 2)
-    #         byte_array.append(byte_value)
-        
-    #     return bytes(byte_array)
-
 
 def main():
     """Основная функция улучшенного трекера"""
