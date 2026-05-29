@@ -58,6 +58,17 @@ VOICE_LO_HZ   = 80        # Нижняя граница голоса
 VOICE_HI_HZ   = 3400      # Верхняя граница голоса
 MIN_FRAMES    = 20         # Минимум фреймов для генерации ключа
 NOISE_FLOOR   = 0.002      # Порог активности (амплитуда 0–1)
+H_MIN_BITS_PER_BYTE = 6.637
+SAFETY_FACTOR = 3
+MIN_POOL_BYTES_128 = 60
+MIN_POOL_BYTES_256 = 117
+
+
+def min_pool_bytes_for_key(key_bits: int) -> int:
+    """Минимальный размер свежего пула по текущей SP800-90B калибровке."""
+    if key_bits <= 128:
+        return MIN_POOL_BYTES_128
+    return MIN_POOL_BYTES_256
 
 
 def is_microphone_available() -> bool:
@@ -490,6 +501,13 @@ class VoiceEntropyCollector:
         avg_rms  = float(np.mean(rms_vals)) if rms_vals else 0.0
         peak_rms = float(np.max(rms_vals))  if rms_vals else 0.0
 
+        if available_frames > 0:
+            fresh_voice_ratio = available_active_frames / available_frames
+        else:
+            fresh_voice_ratio = 0.0
+        fresh_pool_fill = min(1.0, available_pool_size / 200.0)
+        fresh_entropy_quality = (fresh_voice_ratio + fresh_pool_fill) / 2.0
+
         # dBFS
         def to_db(rms): return 20 * math.log10(rms + 1e-10)
         avg_db  = to_db(avg_rms)
@@ -513,7 +531,7 @@ class VoiceEntropyCollector:
                 dominant_freq = float(freqs[mask][np.argmax(spectrum[mask])])
 
         is_active = avg_rms > NOISE_FLOOR
-        quality   = min(100.0, self._entropy_quality * 100)
+        quality   = min(100.0, fresh_entropy_quality * 100)
 
         self._last_stats = {
             "is_active":     is_active,
@@ -552,7 +570,8 @@ def combine_entropy(eye_bytes: bytes, voice_bytes: bytes) -> bytes:
     return bytes(pool)
 
 
-def derive_key(raw_pool: bytes, key_bits: int = 256) -> bytes:
+def derive_key(raw_pool: bytes, key_bits: int = 256,
+               min_pool_bytes: Optional[int] = None) -> bytes:
     """
     Генерирует криптографический ключ из сырого пула энтропии
     единственным вызовом SHA-256.
@@ -561,8 +580,17 @@ def derive_key(raw_pool: bytes, key_bits: int = 256) -> bytes:
     key         = sha256_hash[:key_bits // 8]
 
     Поддерживает key_bits = 128 (берём первые 16 байт) или 256 (все 32 байта).
+    По умолчанию требует свежий пул не меньше текущей SP800-90B калибровки.
     """
-    if len(raw_pool) < 16:
+    if key_bits not in (128, 256):
+        return b""
+
+    required_bytes = (
+        min_pool_bytes
+        if min_pool_bytes is not None
+        else min_pool_bytes_for_key(key_bits)
+    )
+    if len(raw_pool) < required_bytes:
         return b""
 
     sha256_hash = hashlib.sha256(raw_pool).digest()   # единственный вызов хэша
@@ -574,8 +602,8 @@ def generate_combined_key(eye_bytes: bytes,
                           voice_collector: VoiceEntropyCollector,
                           key_bits: int = 256) -> bytes:
     """
-    Высокоуровневая функция: объединяет все накопленные биты взгляда и голоса
-    и возвращает готовый криптографический ключ.
+    Высокоуровневая функция: требует оба источника, объединяет свежие биты
+    взгляда и голоса и возвращает готовый криптографический ключ.
 
     Поток данных:
         eye_bytes + voice_bytes
@@ -590,18 +618,18 @@ def generate_combined_key(eye_bytes: bytes,
     voice_snapshot = voice_collector.get_available_entropy_snapshot()
     voice_bytes = voice_snapshot["bytes"]
 
-    if not eye_bytes and not voice_bytes:
-        print("⚠ Нет данных ни от одного источника")
+    if not eye_bytes:
+        print("⚠ Нет свежих данных взгляда для комбинированного режима")
+        return b""
+    if not voice_bytes:
+        print("⚠ Нет свежих голосовых данных для комбинированного режима")
         return b""
 
-    if not eye_bytes:
-        print("⚠ Нет данных взгляда — используется только голос")
-        raw_pool = voice_bytes
-    elif not voice_bytes:
-        print("⚠ Нет голосовых данных — используется только взгляд")
-        raw_pool = eye_bytes
-    else:
-        raw_pool = combine_entropy(eye_bytes, voice_bytes)
+    raw_pool = combine_entropy(eye_bytes, voice_bytes)
+    min_bytes = min_pool_bytes_for_key(key_bits)
+    if len(raw_pool) < min_bytes:
+        print(f"⚠ Недостаточно свежего пула: {len(raw_pool)}/{min_bytes}B")
+        return b""
 
     key = derive_key(raw_pool, key_bits)
     if key and voice_bytes:

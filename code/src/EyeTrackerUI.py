@@ -23,7 +23,6 @@ from EyeTracker import (
 # Импорт модуля голосовой энтропии
 from VoiceEntropy import (
     VoiceEntropyCollector,
-    generate_combined_key,
     MIN_FRAMES,
     SOUNDDEVICE_AVAILABLE,
 )
@@ -450,9 +449,12 @@ class AudioVisualizerWidget(QWidget):
             self.is_recording = True
             self.timer.start(50)
             print("🎤 Микрофон запущен, сбор голосовой энтропии активен")
+            return True
         else:
             self.is_recording = False
+            self.timer.stop()
             print("⚠ Микрофон недоступен — голосовая энтропия не будет использована")
+            return False
 
     def stop_recording(self):
         self.is_recording = False
@@ -537,13 +539,7 @@ class CameraThread(QThread):
         self.crypto_generator.consume_entropy_until(movement_count)
     
     def reset_data(self):
-        self.tracker.movement_events.clear()
-        self.tracker.gaze_history.clear()
-        self.tracker.eye_state_history.clear()
-        self.tracker.consecutive_still_frames = 0
-        self.tracker.last_movement_time = 0
-        self.tracker.last_valid_gaze = None
-        self.tracker.frame_count = 0
+        self.tracker.reset_tracking_data()
         self.crypto_generator.reset()
         self.stats_updated.emit(self.current_stats())
 
@@ -1721,6 +1717,32 @@ class EyeTrackerUI(QMainWindow):
             self.video_widget.show_loading()
             self.camera_thread.start()
 
+        if show_voice and not self.audio_visualizer.start_recording():
+            if show_eye:
+                if self.camera_thread.isRunning():
+                    self.camera_thread.stop()
+                self.video_widget.hide_loading()
+                self.video_widget.show_placeholder()
+                self.video_widget.first_frame_received = False
+                self.video_widget.is_camera_active = False
+
+            self.audio_stats_widget.stop_monitoring()
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.source_toggle.setEnabled(True)
+            self.status_label.setText("⚠️ Микрофон недоступен")
+            self.status_label.setStyleSheet("""
+                font-size: 14px; font-weight: 500; color: #F44336;
+                padding: 12px; background-color: #3A1F1F; border-radius: 8px;
+            """)
+            QMessageBox.critical(
+                self,
+                "Ошибка микрофона",
+                "Не удалось открыть микрофон. Сбор голосовой энтропии "
+                "не запущен."
+            )
+            return
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
@@ -1735,7 +1757,6 @@ class EyeTrackerUI(QMainWindow):
         self.source_toggle.setEnabled(False)
 
         if show_voice:
-            self.audio_visualizer.start_recording()
             self.audio_stats_widget.start_monitoring()
     
     def stop_tracking(self):
