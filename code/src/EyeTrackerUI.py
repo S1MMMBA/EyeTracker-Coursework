@@ -1025,6 +1025,56 @@ class IconButton(QPushButton):
         """)
 
 
+class FittingMetricLabel(QLabel):
+    """Метка метрики, которая уменьшает шрифт под доступную ширину."""
+
+    def __init__(self, text="", color="#e0e0e0",
+                 base_size=28, min_size=16):
+        super().__init__(text)
+        self._color = color
+        self._base_size = base_size
+        self._min_size = min_size
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._apply_style(base_size)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+        QTimer.singleShot(0, self._fit_to_width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_to_width()
+
+    def _apply_style(self, size):
+        self.setStyleSheet(f"""
+            font-size: {size}px;
+            font-weight: 700;
+            color: {self._color};
+        """)
+
+    def _fit_to_width(self):
+        available_width = self.contentsRect().width()
+        if available_width <= 0 or not self.text():
+            return
+
+        font = self.font()
+        font.setBold(True)
+        chosen_size = self._base_size
+
+        for size in range(self._base_size, self._min_size - 1, -1):
+            font.setPixelSize(size)
+            if QFontMetrics(font).horizontalAdvance(self.text()) <= available_width:
+                chosen_size = size
+                break
+        else:
+            chosen_size = self._min_size
+
+        self._apply_style(chosen_size)
+
+
 class StatisticsWidget(QWidget):
     """Виджет для отображения статистики взгляда"""
     
@@ -1057,13 +1107,7 @@ class StatisticsWidget(QWidget):
             metric_layout = QVBoxLayout()
             metric_layout.setSpacing(5)
             
-            value_label = QLabel(default)
-            value_label.setStyleSheet(f"""
-                font-size: 28px;
-                font-weight: 700;
-                color: {color};
-            """)
-            value_label.setAlignment(Qt.AlignCenter)
+            value_label = FittingMetricLabel(default, color)
             
             name_label = QLabel(label)
             name_label.setStyleSheet("font-size: 12px; color: #aaa;")
