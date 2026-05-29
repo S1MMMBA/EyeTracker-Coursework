@@ -4,9 +4,11 @@
 \usepackage{float}
 \usepackage{cite}
 \usepackage{indentfirst}
-\usepackage[unicode, pdftex]{hyperref}
+\makeatletter
+\@ifpackageloaded{hyperref}{}{\usepackage[unicode]{hyperref}}
+\makeatother
 \usepackage{float}
-\usepackage{color}
+\usepackage{xcolor}
 \usepackage{listings}
 
 \definecolor{pblue}{rgb}{0.13,0.13,1}
@@ -26,7 +28,7 @@
 	numbers=left,
 	numberstyle=\tiny\color{gray},
 	stepnumber=1, 
-	backgroundcolor=\color{white}
+	backgroundcolor=\color{white},
 	showspaces=false,
 	showtabs=false,
 	keywordstyle=\color{pblue},
