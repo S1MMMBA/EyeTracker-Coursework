@@ -1,0 +1,6 @@
+# Python local environment and caches
+venv/
+code/venv/
+__pycache__/
+*.py[cod]
+

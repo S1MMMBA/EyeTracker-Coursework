@@ -6,7 +6,8 @@
 
 ## 📋 Требования
 
-- **Python** 3.9 или выше
+- **Python** 3.10-3.12. Python 3.13 не подходит для текущей версии
+  проекта: он ставит MediaPipe без legacy API `mp.solutions.face_mesh`.
 - **Веб-камера** (для режимов «Взгляд» и «Оба»)
 - **Микрофон** (для режимов «Голос» и «Оба»)
 - **OS:** Windows 10/11, Linux, macOS
@@ -19,14 +20,25 @@
 
 ```bash
 git clone <url-репозитория>
-cd EyeTracker-Coursework
+cd EyeTracker-Coursework/code
 ```
 
 ### 2. (Рекомендуется) Создать виртуальное окружение
 
 ```bash
+# Если используется pyenv/pyenv-win, версия уже зафиксирована
+# в файле .python-version. При необходимости установите ее:
+pyenv install 3.12.7
+
+# Убедитесь, что команда показывает Python 3.12.x
+python --version
+
 python -m venv venv
 ```
+
+Если `python --version` показывает Python 3.13, не продолжайте установку
+зависимостей: сначала установите Python 3.12 и создайте окружение его
+интерпретатором.
 
 Активация:
 - **Windows:**
@@ -41,18 +53,18 @@ python -m venv venv
 ### 3. Установить все зависимости
 
 ```bash
-pip install opencv-python numpy mediapipe PyQt5 sounddevice matplotlib
+python -m pip install -r requirements.txt
 ```
 
 Или по одному, если нужна отладка:
 
 ```bash
-pip install opencv-python      # захват и обработка видео
-pip install numpy               # математические операции
-pip install mediapipe           # трекинг лица и глаз
-pip install PyQt5               # графический интерфейс
-pip install sounddevice         # захват звука с микрофона
-pip install matplotlib          # визуализация (используется ядром)
+pip install "opencv-contrib-python<4.12"  # захват и обработка видео
+pip install "numpy<2"                     # математические операции
+pip install mediapipe==0.10.21            # трекинг лица и глаз
+pip install PyQt5                         # графический интерфейс
+pip install sounddevice                   # захват звука с микрофона
+pip install matplotlib                    # визуализация (используется ядром)
 ```
 
 ---
@@ -60,7 +72,7 @@ pip install matplotlib          # визуализация (использует
 ## 🚀 Запуск
 
 ```bash
-python EyeTrackerUI.py
+python src/EyeTrackerUI.py
 ```
 
 ---
@@ -69,10 +81,13 @@ python EyeTrackerUI.py
 
 ```
 EyeTracker-Coursework/
-├── EyeTrackerUI.py      # Графический интерфейс (точка входа)
-├── EyeTracker.py        # Ядро трекинга взгляда и генерации битов
-├── VoiceEntropy.py      # Сбор энтропии из микрофона
-└── README.md
+└── code/
+    ├── src/
+    │   ├── EyeTrackerUI.py   # Графический интерфейс (точка входа)
+    │   ├── EyeTracker.py     # Ядро трекинга взгляда и генерации битов
+    │   └── VoiceEntropy.py   # Сбор энтропии из микрофона
+    ├── requirements.txt
+    └── README.md
 ```
 
 ---
@@ -131,11 +146,20 @@ EyeTracker-Coursework/
 
 ### MediaPipe не установлен
 ```bash
-pip install mediapipe
+python -m pip install -r requirements.txt
 ```
-На некоторых системах требуется конкретная версия:
-```bash
-pip install mediapipe==0.10.9
+
+Если используется Python 3.13, `pip install mediapipe` поставит новую
+ветку MediaPipe без `mp.solutions.face_mesh`. Для этого проекта нужно
+пересоздать окружение под Python 3.10-3.12:
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force venv
+pyenv install 3.12.7
+python -m venv venv
+venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
 ### Микрофон не работает

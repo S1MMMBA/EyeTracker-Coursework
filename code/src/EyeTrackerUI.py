@@ -15,7 +15,8 @@ import subprocess
 from EyeTracker import (
     AdvancedGazeTracker,
     MovementBasedCryptoGenerator,
-    MEDIAPIPE_AVAILABLE
+    MEDIAPIPE_AVAILABLE,
+    MEDIAPIPE_IMPORT_ERROR,
 )
 
 # Импорт модуля голосовой энтропии
@@ -1573,7 +1574,13 @@ class EyeTrackerUI(QMainWindow):
     
     def check_dependencies(self):
         if not MEDIAPIPE_AVAILABLE:
-            QMessageBox.critical(self, "Ошибка", "MediaPipe не установлен!")
+            QMessageBox.critical(
+                self,
+                "Ошибка MediaPipe",
+                "MediaPipe недоступен:\n"
+                f"{MEDIAPIPE_IMPORT_ERROR}\n\n"
+                "Установите зависимости из requirements.txt под Python 3.10-3.12.",
+            )
     
     def show_instruction(self):
         if not self.instruction_window:

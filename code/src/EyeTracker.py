@@ -10,11 +10,14 @@ from datetime import datetime
 
 try:
     import mediapipe as mp
-    from mediapipe.python.solutions.face_mesh import FaceMesh
+    mp.solutions.face_mesh.FaceMesh
     MEDIAPIPE_AVAILABLE = True
-except ImportError:
+    MEDIAPIPE_IMPORT_ERROR = None
+except Exception as exc:
+    mp = None
     MEDIAPIPE_AVAILABLE = False
-    print("MediaPipe не установлен. Установите: pip install mediapipe")
+    MEDIAPIPE_IMPORT_ERROR = exc
+    print(f"MediaPipe недоступен: {exc}")
 
 class AdvancedGazeTracker:
     
@@ -49,11 +52,18 @@ class AdvancedGazeTracker:
         self.calibration_data = {}
         self.is_calibrated = False
         
-        print(" Продвинутый трекер взгляда инициализирован (только MediaPipe)")
+        if MEDIAPIPE_AVAILABLE:
+            print(" Продвинутый трекер взгляда инициализирован (MediaPipe FaceMesh)")
+        else:
+            print(" Трекер взгляда запущен без MediaPipe FaceMesh")
+            print(f" Причина: {MEDIAPIPE_IMPORT_ERROR}")
         print(f" Разрешение экрана: {screen_width}x{screen_height}")
     
     def _initialize_mediapipe(self):
         """Инициализация MediaPipe с оптимизированными параметрами"""
+        self.mp_face_mesh = None
+        self.face_mesh = None
+
         if not MEDIAPIPE_AVAILABLE:
             return
             
@@ -522,7 +532,8 @@ class MovementBasedCryptoGenerator:
 def main():
     """Основная функция улучшенного трекера"""
     if not MEDIAPIPE_AVAILABLE:
-        print(" MediaPipe не установлен. Установите: pip install mediapipe")
+        print(f" MediaPipe недоступен: {MEDIAPIPE_IMPORT_ERROR}")
+        print(" Установите зависимости из requirements.txt под Python 3.10-3.12")
         return
     
     # Инициализация
