@@ -499,8 +499,7 @@ class CameraThread(QThread):
                 self.frame_ready.emit(processed_frame, gaze_data)
                 
                 if self.tracker.frame_count % 10 == 0:
-                    stats = self.tracker.get_movement_statistics()
-                    self.stats_updated.emit(stats)
+                    self.stats_updated.emit(self.current_stats())
             
             self.msleep(10)
             
@@ -517,6 +516,14 @@ class CameraThread(QThread):
     def available_movement_count(self) -> int:
         return self.crypto_generator.available_movement_count()
 
+    def current_stats(self) -> dict:
+        stats = self.tracker.get_movement_statistics()
+        available_count = self.available_movement_count()
+        total_count = stats.get("movement_count", 0)
+        stats["available_movement_count"] = available_count
+        stats["consumed_movement_count"] = max(0, total_count - available_count)
+        return stats
+
     def get_entropy_snapshot(self):
         return self.crypto_generator.get_available_entropy_snapshot()
 
@@ -532,6 +539,7 @@ class CameraThread(QThread):
         self.tracker.last_valid_gaze = None
         self.tracker.frame_count = 0
         self.crypto_generator.reset()
+        self.stats_updated.emit(self.current_stats())
 
 
 class StarWidget(QWidget):
@@ -1035,7 +1043,7 @@ class StatisticsWidget(QWidget):
         self.metrics = {}
         metrics_data = [
             ("total_frames", "Кадры", "0", "#2196F3"),
-            ("movement_count", "Движения", "0", "#4CAF50"),
+            ("movement_count", "Новые/всего", "0", "#4CAF50"),
             ("movement_rate", "Частота", "0%", "#FF9800"),
             ("data_quality", "Качество", "0%", "#9C27B0"),
             ("avg_magnitude", "Амплитуда", "0 px", "#F44336"),
@@ -1109,20 +1117,35 @@ class StatisticsWidget(QWidget):
     
     def update_stats(self, stats: dict):
         self.metrics["total_frames"].setText(str(stats.get('total_frames', 0)))
-        self.metrics["movement_count"].setText(str(stats.get('movement_count', 0)))
+        total_movement_count = stats.get('movement_count', 0)
+        fresh_movement_count = stats.get(
+            'available_movement_count', total_movement_count
+        )
+        consumed_movement_count = stats.get('consumed_movement_count', 0)
+
+        if consumed_movement_count > 0:
+            movement_text = f"{fresh_movement_count}/{total_movement_count}"
+        else:
+            movement_text = str(fresh_movement_count)
+        self.metrics["movement_count"].setText(movement_text)
         self.metrics["movement_rate"].setText(f"{stats.get('movement_rate', 0):.1f}%")
         self.metrics["data_quality"].setText(f"{stats.get('data_quality', 0):.1f}%")
         self.metrics["avg_magnitude"].setText(f"{stats.get('avg_movement_magnitude', 0):.1f} px")
         
-        movement_count = stats.get('movement_count', 0)
-        entropy_quality = min(100, movement_count / 2)
+        entropy_quality = min(
+            100,
+            fresh_movement_count / MIN_EYE_MOVEMENTS_PER_KEY * 100
+        )
         self.entropy_bar.setValue(int(entropy_quality))
         self.entropy_value.setText(f"{int(entropy_quality)}%")
         
-        if movement_count < 20:
-            self.entropy_label.setText("⚠️ Соберите больше движений")
+        if fresh_movement_count < MIN_EYE_MOVEMENTS_PER_KEY:
+            self.entropy_label.setText("⚠️ Соберите больше новых движений")
             self.entropy_label.setStyleSheet("font-size: 12px; color: #F44336;")
-        elif movement_count < 50:
+        elif consumed_movement_count > 0:
+            self.entropy_label.setText("✅ Достаточно новых движений")
+            self.entropy_label.setStyleSheet("font-size: 12px; color: #4CAF50;")
+        elif fresh_movement_count < 50:
             self.entropy_label.setText("📈 Хорошо, продолжайте")
             self.entropy_label.setStyleSheet("font-size: 12px; color: #FF9800;")
         else:
@@ -1880,6 +1903,7 @@ class EyeTrackerUI(QMainWindow):
 
             if use_eye and eye_bytes and eye_end_index is not None:
                 self.camera_thread.consume_entropy_until(eye_end_index)
+                self.stats_widget.update_stats(self.camera_thread.current_stats())
             if use_voice and voice_bytes and voice_end_index is not None:
                 voice_collector.consume_entropy_until(
                     voice_end_index, voice_frame_end, voice_active_end
