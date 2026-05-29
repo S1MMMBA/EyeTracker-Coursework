@@ -484,6 +484,10 @@ class CameraThread(QThread):
         self.cap = cv2.VideoCapture(0)
         
         if not self.cap.isOpened():
+            self.running = False
+            if self.cap:
+                self.cap.release()
+                self.cap = None
             self.error_occurred.emit("Не удалось открыть камеру")
             return
         
@@ -519,9 +523,11 @@ class CameraThread(QThread):
     def current_stats(self) -> dict:
         stats = self.tracker.get_movement_statistics()
         available_count = self.available_movement_count()
+        eye_bytes, _, _ = self.get_entropy_snapshot()
         total_count = stats.get("movement_count", 0)
         stats["available_movement_count"] = available_count
         stats["consumed_movement_count"] = max(0, total_count - available_count)
+        stats["available_entropy_bytes"] = len(eye_bytes)
         return stats
 
     def get_entropy_snapshot(self):
@@ -1044,6 +1050,7 @@ class StatisticsWidget(QWidget):
         metrics_data = [
             ("total_frames", "Кадры", "0", "#2196F3"),
             ("movement_count", "Новые/всего", "0", "#4CAF50"),
+            ("entropy_bytes", "Пул 256", "0/117 Б", "#00BCD4"),
             ("movement_rate", "Частота", "0%", "#FF9800"),
             ("data_quality", "Качество", "0%", "#9C27B0"),
             ("avg_magnitude", "Амплитуда", "0 px", "#F44336"),
@@ -1128,26 +1135,32 @@ class StatisticsWidget(QWidget):
         else:
             movement_text = str(fresh_movement_count)
         self.metrics["movement_count"].setText(movement_text)
+        fresh_entropy_bytes = stats.get('available_entropy_bytes', 0)
+        self.metrics["entropy_bytes"].setText(
+            f"{fresh_entropy_bytes}/{MIN_POOL_BYTES_256} Б"
+        )
         self.metrics["movement_rate"].setText(f"{stats.get('movement_rate', 0):.1f}%")
         self.metrics["data_quality"].setText(f"{stats.get('data_quality', 0):.1f}%")
         self.metrics["avg_magnitude"].setText(f"{stats.get('avg_movement_magnitude', 0):.1f} px")
         
-        entropy_quality = min(
-            100,
-            fresh_movement_count / MIN_EYE_MOVEMENTS_PER_KEY * 100
-        )
+        movement_ready = fresh_movement_count / MIN_EYE_MOVEMENTS_PER_KEY
+        pool_ready = fresh_entropy_bytes / MIN_POOL_BYTES_256
+        entropy_quality = min(100, min(movement_ready, pool_ready) * 100)
         self.entropy_bar.setValue(int(entropy_quality))
         self.entropy_value.setText(f"{int(entropy_quality)}%")
         
         if fresh_movement_count < MIN_EYE_MOVEMENTS_PER_KEY:
             self.entropy_label.setText("⚠️ Соберите больше новых движений")
             self.entropy_label.setStyleSheet("font-size: 12px; color: #F44336;")
-        elif consumed_movement_count > 0:
-            self.entropy_label.setText("✅ Достаточно новых движений")
-            self.entropy_label.setStyleSheet("font-size: 12px; color: #4CAF50;")
-        elif fresh_movement_count < 50:
-            self.entropy_label.setText("📈 Хорошо, продолжайте")
+        elif fresh_entropy_bytes < MIN_POOL_BYTES_128:
+            self.entropy_label.setText("⚠️ Свежий пул мал даже для 128 бит")
+            self.entropy_label.setStyleSheet("font-size: 12px; color: #F44336;")
+        elif fresh_entropy_bytes < MIN_POOL_BYTES_256:
+            self.entropy_label.setText("📈 Достаточно для 128 бит, мало для 256")
             self.entropy_label.setStyleSheet("font-size: 12px; color: #FF9800;")
+        elif fresh_movement_count < 50:
+            self.entropy_label.setText("✅ Достаточно для 256 бит")
+            self.entropy_label.setStyleSheet("font-size: 12px; color: #4CAF50;")
         else:
             self.entropy_label.setText("✅ Отличное качество энтропии")
             self.entropy_label.setStyleSheet("font-size: 12px; color: #4CAF50;")
@@ -1774,6 +1787,7 @@ class EyeTrackerUI(QMainWindow):
         self.save_pool_btn.setEnabled(False)
     
     def generate_key(self, bits: int):
+        requested_source = self._entropy_source
         use_eye   = self._entropy_source in ("eye",   "both")
         use_voice = self._entropy_source in ("voice", "both")
 
@@ -1819,11 +1833,19 @@ class EyeTrackerUI(QMainWindow):
                 voice_silence_pct = (
                     (voice_frame_count - voice_active_frames) / voice_frame_count
                 )
-            voice_ok = (
-                mic_ok
-                and voice_frame_count >= MIN_FRAMES
-                and voice_silence_pct <= 0.40
-            )
+            voice_error = ""
+            if not mic_ok:
+                voice_error = "микрофон недоступен"
+            elif voice_frame_count < MIN_FRAMES:
+                voice_error = (
+                    f"новых голосовых фреймов {voice_frame_count}/{MIN_FRAMES}"
+                )
+            elif voice_silence_pct > 0.40:
+                voice_error = f"тишина {int(voice_silence_pct * 100)}% > 40%"
+            elif not voice_snapshot["bytes"]:
+                voice_error = "нет новых голосовых байт"
+
+            voice_ok = not voice_error
             if voice_ok:
                 voice_bytes = voice_snapshot["bytes"]
                 voice_end_index = voice_snapshot["pool_end"]
@@ -1835,19 +1857,20 @@ class EyeTrackerUI(QMainWindow):
                 voice_frame_end = None
                 voice_active_end = None
 
-            if not mic_ok:
-                source_info = " [микрофон недоступен]"
-                use_voice = False
-            elif voice_frame_count < MIN_FRAMES:
-                source_info = (
-                    f" [голос отброшен — новых фреймов "
-                    f"{voice_frame_count}/{MIN_FRAMES}]"
+            if not voice_ok:
+                if requested_source == "both":
+                    QMessageBox.warning(
+                        self, "Недостаточно источников",
+                        "В режиме «Оба» ключ генерируется только при "
+                        "доступности взгляда и голоса.\n\n"
+                        f"Причина: {voice_error}."
+                    )
+                    return
+                QMessageBox.warning(
+                    self, "Недостаточно данных",
+                    f"Голосовой источник недоступен: {voice_error}."
                 )
-                use_voice = False
-            elif not voice_ok:
-                silence_pct = int(voice_silence_pct * 100)
-                source_info = f" [голос отброшен — тишина {silence_pct}% > 40%]"
-                use_voice = False
+                return
         else:
             voice_bytes = b""
             voice_end_index = None
@@ -1855,17 +1878,13 @@ class EyeTrackerUI(QMainWindow):
             voice_active_end = None
 
         # ── Строим raw_pool из доступных источников ───────────────────────
-        if use_eye and use_voice and eye_bytes and voice_bytes:
+        if requested_source == "both" and eye_bytes and voice_bytes:
             raw_pool    = combine_entropy(eye_bytes, voice_bytes)
             source_info = " [👁+🎤]"
-        elif use_eye and eye_bytes:
+        elif requested_source == "eye" and eye_bytes:
             raw_pool    = eye_bytes
-            source_info = (
-                " [👁]"
-                if self._entropy_source == "eye"
-                else " [👁 — голос недоступен]"
-            )
-        elif use_voice and voice_bytes:
+            source_info = " [👁]"
+        elif requested_source == "voice" and voice_bytes:
             raw_pool    = voice_bytes
             source_info = " [🎤]"
         else:
@@ -1978,6 +1997,16 @@ class EyeTrackerUI(QMainWindow):
         QMessageBox.critical(self, "Ошибка", error_msg)
         self.video_widget.hide_loading()
         self.video_widget.show_placeholder()
+        self.audio_visualizer.stop_recording()
+        self.audio_stats_widget.stop_monitoring()
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.source_toggle.setEnabled(True)
+        self.status_label.setText("⚠️ Трекинг не запущен")
+        self.status_label.setStyleSheet("""
+            font-size: 14px; font-weight: 500; color: #F44336;
+            padding: 12px; background-color: #3A1F1F; border-radius: 8px;
+        """)
     
     def closeEvent(self, event):
         if self.camera_thread.isRunning():
