@@ -58,6 +58,17 @@ VOICE_LO_HZ   = 80        # Нижняя граница голоса
 VOICE_HI_HZ   = 3400      # Верхняя граница голоса
 MIN_FRAMES    = 20         # Минимум фреймов для генерации ключа
 NOISE_FLOOR   = 0.002      # Порог активности (амплитуда 0–1)
+H_MIN_BITS_PER_BYTE = 6.637
+SAFETY_FACTOR = 3
+MIN_POOL_BYTES_128 = 60
+MIN_POOL_BYTES_256 = 117
+
+
+def min_pool_bytes_for_key(key_bits: int) -> int:
+    """Минимальный размер свежего пула по текущей SP800-90B калибровке."""
+    if key_bits <= 128:
+        return MIN_POOL_BYTES_128
+    return MIN_POOL_BYTES_256
 
 
 def is_microphone_available() -> bool:
@@ -226,9 +237,12 @@ class VoiceEntropyCollector:
     def __init__(self):
         self._lock            = threading.Lock()
         self._entropy_pool    : bytearray = bytearray()   # накопленные байты
+        self._consumed_pool_bytes: int = 0
         self._bit_buffer      : List[int] = []            # текущий буфер битов
         self._frame_count     : int = 0
         self._active_frames   : int = 0                   # фреймы с голосом
+        self._consumed_frame_count: int = 0
+        self._consumed_active_frames: int = 0
         self._running              : bool = False
         self._microphone_confirmed : bool = False   # True только после успешного start()
         self._stream               : Optional[object] = None   # sd.InputStream
@@ -285,9 +299,12 @@ class VoiceEntropyCollector:
         """Сбрасывает накопленные данные."""
         with self._lock:
             self._entropy_pool.clear()
+            self._consumed_pool_bytes = 0
             self._bit_buffer.clear()
             self._frame_count  = 0
             self._active_frames = 0
+            self._consumed_frame_count = 0
+            self._consumed_active_frames = 0
             self._amplitude_history.clear()
             self._snr_history.clear()
             self._entropy_quality = 0.0
@@ -396,6 +413,52 @@ class VoiceEntropyCollector:
         with self._lock:
             return bytes(self._entropy_pool)
 
+    def get_available_entropy_snapshot(self) -> dict:
+        """
+        Возвращает новые байты, ещё не использованные для генерации ключа,
+        статистику свежего сегмента и конечные индексы снимка.
+        Пул не очищается.
+        """
+        if not self._microphone_confirmed:
+            return {
+                "bytes": b"",
+                "pool_end": self._consumed_pool_bytes,
+                "frame_end": self._consumed_frame_count,
+                "active_end": self._consumed_active_frames,
+                "frame_count": 0,
+                "active_frames": 0,
+            }
+        with self._lock:
+            start = min(self._consumed_pool_bytes, len(self._entropy_pool))
+            frame_count = self._frame_count - self._consumed_frame_count
+            active_frames = self._active_frames - self._consumed_active_frames
+            return {
+                "bytes": bytes(self._entropy_pool[start:]),
+                "pool_end": len(self._entropy_pool),
+                "frame_end": self._frame_count,
+                "active_end": self._active_frames,
+                "frame_count": frame_count,
+                "active_frames": active_frames,
+            }
+
+    def consume_entropy_until(self, pool_size: int,
+                              frame_count: Optional[int] = None,
+                              active_frames: Optional[int] = None):
+        """Помечает байты до pool_size как использованные."""
+        with self._lock:
+            pool_size = max(0, min(pool_size, len(self._entropy_pool)))
+            self._consumed_pool_bytes = max(self._consumed_pool_bytes, pool_size)
+            if frame_count is not None:
+                frame_count = max(0, min(frame_count, self._frame_count))
+                self._consumed_frame_count = max(
+                    self._consumed_frame_count, frame_count
+                )
+            if active_frames is not None:
+                active_frames = max(0, min(active_frames, self._active_frames))
+                self._consumed_active_frames = max(
+                    self._consumed_active_frames, active_frames
+                )
+
     def microphone_active(self) -> bool:
         """Возвращает True если микрофон был успешно открыт и работает."""
         return self._microphone_confirmed and self._running
@@ -428,10 +491,22 @@ class VoiceEntropyCollector:
         """Статистика для обновления UI."""
         with self._lock:
             pool_size = len(self._entropy_pool)
+            available_pool_size = max(0, pool_size - self._consumed_pool_bytes)
+            available_frames = self._frame_count - self._consumed_frame_count
+            available_active_frames = (
+                self._active_frames - self._consumed_active_frames
+            )
 
         rms_vals = list(self._amplitude_history)
         avg_rms  = float(np.mean(rms_vals)) if rms_vals else 0.0
         peak_rms = float(np.max(rms_vals))  if rms_vals else 0.0
+
+        if available_frames > 0:
+            fresh_voice_ratio = available_active_frames / available_frames
+        else:
+            fresh_voice_ratio = 0.0
+        fresh_pool_fill = min(1.0, available_pool_size / 200.0)
+        fresh_entropy_quality = (fresh_voice_ratio + fresh_pool_fill) / 2.0
 
         # dBFS
         def to_db(rms): return 20 * math.log10(rms + 1e-10)
@@ -456,13 +531,16 @@ class VoiceEntropyCollector:
                 dominant_freq = float(freqs[mask][np.argmax(spectrum[mask])])
 
         is_active = avg_rms > NOISE_FLOOR
-        quality   = min(100.0, self._entropy_quality * 100)
+        quality   = min(100.0, fresh_entropy_quality * 100)
 
         self._last_stats = {
             "is_active":     is_active,
             "frame_count":   self._frame_count,
             "active_frames": self._active_frames,
             "pool_bytes":    pool_size,
+            "available_pool_bytes": available_pool_size,
+            "available_frames": available_frames,
+            "available_active_frames": available_active_frames,
             "avg_db":        avg_db,
             "peak_db":       peak_db,
             "snr_db":        snr_db,
@@ -492,7 +570,8 @@ def combine_entropy(eye_bytes: bytes, voice_bytes: bytes) -> bytes:
     return bytes(pool)
 
 
-def derive_key(raw_pool: bytes, key_bits: int = 256) -> bytes:
+def derive_key(raw_pool: bytes, key_bits: int = 256,
+               min_pool_bytes: Optional[int] = None) -> bytes:
     """
     Генерирует криптографический ключ из сырого пула энтропии
     единственным вызовом SHA-256.
@@ -501,8 +580,17 @@ def derive_key(raw_pool: bytes, key_bits: int = 256) -> bytes:
     key         = sha256_hash[:key_bits // 8]
 
     Поддерживает key_bits = 128 (берём первые 16 байт) или 256 (все 32 байта).
+    По умолчанию требует свежий пул не меньше текущей SP800-90B калибровки.
     """
-    if len(raw_pool) < 16:
+    if key_bits not in (128, 256):
+        return b""
+
+    required_bytes = (
+        min_pool_bytes
+        if min_pool_bytes is not None
+        else min_pool_bytes_for_key(key_bits)
+    )
+    if len(raw_pool) < required_bytes:
         return b""
 
     sha256_hash = hashlib.sha256(raw_pool).digest()   # единственный вызов хэша
@@ -514,8 +602,8 @@ def generate_combined_key(eye_bytes: bytes,
                           voice_collector: VoiceEntropyCollector,
                           key_bits: int = 256) -> bytes:
     """
-    Высокоуровневая функция: объединяет все накопленные биты взгляда и голоса
-    и возвращает готовый криптографический ключ.
+    Высокоуровневая функция: требует оба источника, объединяет свежие биты
+    взгляда и голоса и возвращает готовый криптографический ключ.
 
     Поток данных:
         eye_bytes + voice_bytes
@@ -524,24 +612,32 @@ def generate_combined_key(eye_bytes: bytes,
               ↓  derive_key()        — всё хэширование здесь
         key (128 или 256 бит)
 
-    Возвращает bytes длиной key_bits//8 или пустые байты при ошибке.
+    При успешной генерации помечает использованные голосовые байты как
+    израсходованные. Возвращает bytes длиной key_bits//8 или пустые байты.
     """
-    voice_bytes = voice_collector.get_entropy_bytes()
-
-    if not eye_bytes and not voice_bytes:
-        print("⚠ Нет данных ни от одного источника")
-        return b""
+    voice_snapshot = voice_collector.get_available_entropy_snapshot()
+    voice_bytes = voice_snapshot["bytes"]
 
     if not eye_bytes:
-        print("⚠ Нет данных взгляда — используется только голос")
-        raw_pool = voice_bytes
-    elif not voice_bytes:
-        print("⚠ Нет голосовых данных — используется только взгляд")
-        raw_pool = eye_bytes
-    else:
-        raw_pool = combine_entropy(eye_bytes, voice_bytes)
+        print("⚠ Нет свежих данных взгляда для комбинированного режима")
+        return b""
+    if not voice_bytes:
+        print("⚠ Нет свежих голосовых данных для комбинированного режима")
+        return b""
+
+    raw_pool = combine_entropy(eye_bytes, voice_bytes)
+    min_bytes = min_pool_bytes_for_key(key_bits)
+    if len(raw_pool) < min_bytes:
+        print(f"⚠ Недостаточно свежего пула: {len(raw_pool)}/{min_bytes}B")
+        return b""
 
     key = derive_key(raw_pool, key_bits)
+    if key and voice_bytes:
+        voice_collector.consume_entropy_until(
+            voice_snapshot["pool_end"],
+            voice_snapshot["frame_end"],
+            voice_snapshot["active_end"],
+        )
     print(f"✅ Ключ {key_bits} бит сгенерирован "
           f"(глаз: {len(eye_bytes)}B  голос: {len(voice_bytes)}B  "
           f"пул: {len(raw_pool)}B)")

@@ -1,0 +1,9 @@
+# Python local environment and caches
+venv/
+code/venv/
+__pycache__/
+*.py[cod]
+
+# Generated keys and raw entropy dumps
+code/*.bin
+newbits_data_*.bin

@@ -3,18 +3,36 @@ import numpy as np
 import math
 import time
 import hashlib
+import threading
 from collections import deque, Counter
 from typing import List, Tuple, Dict, Any
 import matplotlib.pyplot as plt
 from datetime import datetime
+from pathlib import Path
+
+MIN_EYE_MOVEMENTS_PER_KEY = 20
+H_MIN_BITS_PER_BYTE = 6.637
+SAFETY_FACTOR = 3
+MIN_POOL_BYTES_128 = 60
+MIN_POOL_BYTES_256 = 117
+
+
+def min_pool_bytes_for_key(key_bits: int) -> int:
+    """Возвращает минимальный размер свежего пула для ключа."""
+    if key_bits <= 128:
+        return MIN_POOL_BYTES_128
+    return MIN_POOL_BYTES_256
 
 try:
     import mediapipe as mp
-    from mediapipe.python.solutions.face_mesh import FaceMesh
+    mp.solutions.face_mesh.FaceMesh
     MEDIAPIPE_AVAILABLE = True
-except ImportError:
+    MEDIAPIPE_IMPORT_ERROR = None
+except Exception as exc:
+    mp = None
     MEDIAPIPE_AVAILABLE = False
-    print("MediaPipe не установлен. Установите: pip install mediapipe")
+    MEDIAPIPE_IMPORT_ERROR = exc
+    print(f"MediaPipe недоступен: {exc}")
 
 class AdvancedGazeTracker:
     
@@ -48,12 +66,20 @@ class AdvancedGazeTracker:
         # Калибровка
         self.calibration_data = {}
         self.is_calibrated = False
+        self._data_lock = threading.RLock()
         
-        print(" Продвинутый трекер взгляда инициализирован (только MediaPipe)")
+        if MEDIAPIPE_AVAILABLE:
+            print(" Продвинутый трекер взгляда инициализирован (MediaPipe FaceMesh)")
+        else:
+            print(" Трекер взгляда запущен без MediaPipe FaceMesh")
+            print(f" Причина: {MEDIAPIPE_IMPORT_ERROR}")
         print(f" Разрешение экрана: {screen_width}x{screen_height}")
     
     def _initialize_mediapipe(self):
         """Инициализация MediaPipe с оптимизированными параметрами"""
+        self.mp_face_mesh = None
+        self.face_mesh = None
+
         if not MEDIAPIPE_AVAILABLE:
             return
             
@@ -93,7 +119,8 @@ class AdvancedGazeTracker:
             for face_landmarks in results.multi_face_landmarks:
                 # 1. Проверка состояния глаз
                 eye_state = self._analyze_eye_state(face_landmarks)
-                self.eye_state_history.append(eye_state)
+                with self._data_lock:
+                    self.eye_state_history.append(eye_state)
                 
                 # Пропускаем кадр если глаза закрыты
                 if not eye_state['eyes_open']:
@@ -104,31 +131,33 @@ class AdvancedGazeTracker:
                 current_gaze = self._calculate_advanced_gaze(face_landmarks, frame.shape)
                 
                 # 3. Проверка движения
-                movement_detected, movement_info = self._detect_significant_movement(current_gaze)
-                
-                if movement_detected:
-                    # СОХРАНЯЕМ ДАННЫЕ ТОЛЬКО ПРИ ДВИЖЕНИИ
-                    gaze_data = {
-                        'x': float(current_gaze[0]),
-                        'y': float(current_gaze[1]),
-                        'timestamp': time.time(),
-                        'valid': True,
-                        'movement_detected': True,
-                        'movement_magnitude': movement_info['magnitude'],
-                        'movement_direction': movement_info['direction'],
-                        'eye_openness': eye_state['avg_openness'],
-                        'attention_score': self._calculate_attention_score(eye_state)
-                    }
-                    
-                    self.movement_events.append(gaze_data)
-                    self.last_movement_time = time.time()
-                    self.consecutive_still_frames = 0
-                    self.last_valid_gaze = current_gaze
-                    
-                else:
-                    # Нет движения - не сохраняем данные
-                    self.consecutive_still_frames += 1
-                    gaze_data = None
+                with self._data_lock:
+                    movement_detected, movement_info = \
+                        self._detect_significant_movement(current_gaze)
+
+                    if movement_detected:
+                        # СОХРАНЯЕМ ДАННЫЕ ТОЛЬКО ПРИ ДВИЖЕНИИ
+                        gaze_data = {
+                            'x': float(current_gaze[0]),
+                            'y': float(current_gaze[1]),
+                            'timestamp': time.time(),
+                            'valid': True,
+                            'movement_detected': True,
+                            'movement_magnitude': movement_info['magnitude'],
+                            'movement_direction': movement_info['direction'],
+                            'eye_openness': eye_state['avg_openness'],
+                            'attention_score': self._calculate_attention_score(eye_state)
+                        }
+
+                        self.movement_events.append(gaze_data)
+                        self.last_movement_time = time.time()
+                        self.consecutive_still_frames = 0
+                        self.last_valid_gaze = current_gaze
+
+                    else:
+                        # Нет движения - не сохраняем данные
+                        self.consecutive_still_frames += 1
+                        gaze_data = None
                 
                 # Визуализация
                 self._draw_advanced_visualization(frame, face_landmarks, movement_detected, current_gaze)
@@ -136,7 +165,8 @@ class AdvancedGazeTracker:
                 status_color = (0, 255, 0) if movement_detected else (0, 165, 255)
                 self._draw_status(frame, status_text, status_color)
         
-        self.frame_count += 1
+        with self._data_lock:
+            self.frame_count += 1
         return frame, gaze_data
     
     def _analyze_eye_state(self, landmarks):
@@ -245,39 +275,40 @@ class AdvancedGazeTracker:
     
     def _detect_significant_movement(self, current_gaze):
         """Детекция значительного движения глаз"""
-        current_time = time.time()
-        
-        # Проверяем временной интервал
-        time_since_last_movement = current_time - self.last_movement_time
-        if time_since_last_movement < self.min_movement_interval:
+        with self._data_lock:
+            current_time = time.time()
+
+            # Проверяем временной интервал
+            time_since_last_movement = current_time - self.last_movement_time
+            if time_since_last_movement < self.min_movement_interval:
+                return False, {}
+
+            # Если это первое движение
+            if self.last_valid_gaze is None:
+                self.last_valid_gaze = current_gaze
+                self.gaze_history.append(current_gaze)
+                return True, {'magnitude': 0, 'direction': 0}
+
+            # Вычисляем величину движения
+            movement_magnitude = math.sqrt(
+                (current_gaze[0] - self.last_valid_gaze[0])**2 +
+                (current_gaze[1] - self.last_valid_gaze[1])**2
+            )
+
+            # Вычисляем направление движения
+            dx = current_gaze[0] - self.last_valid_gaze[0]
+            dy = current_gaze[1] - self.last_valid_gaze[1]
+            movement_direction = math.atan2(dy, dx)
+
+            # Проверяем порог движения
+            if movement_magnitude > self.movement_threshold:
+                self.gaze_history.append(current_gaze)
+                return True, {
+                    'magnitude': movement_magnitude,
+                    'direction': movement_direction
+                }
+
             return False, {}
-        
-        # Если это первое движение
-        if self.last_valid_gaze is None:
-            self.last_valid_gaze = current_gaze
-            self.gaze_history.append(current_gaze)
-            return True, {'magnitude': 0, 'direction': 0}
-        
-        # Вычисляем величину движения
-        movement_magnitude = math.sqrt(
-            (current_gaze[0] - self.last_valid_gaze[0])**2 + 
-            (current_gaze[1] - self.last_valid_gaze[1])**2
-        )
-        
-        # Вычисляем направление движения
-        dx = current_gaze[0] - self.last_valid_gaze[0]
-        dy = current_gaze[1] - self.last_valid_gaze[1]
-        movement_direction = math.atan2(dy, dx)
-        
-        # Проверяем порог движения
-        if movement_magnitude > self.movement_threshold:
-            self.gaze_history.append(current_gaze)
-            return True, {
-                'magnitude': movement_magnitude,
-                'direction': movement_direction
-            }
-        
-        return False, {}
     
     def _calculate_attention_score(self, eye_state):
         """Оценка уровня внимания на основе состояния глаз"""
@@ -328,10 +359,14 @@ class AdvancedGazeTracker:
         stats = self.get_movement_statistics()
         
         # Исправляем условное выражение
-        if self.eye_state_history:
-            eye_status = 'OPEN' if self.eye_state_history[-1]['eyes_open'] else 'CLOSED'
-        else:
-            eye_status = 'UNKNOWN'
+        with self._data_lock:
+            if self.eye_state_history:
+                eye_status = (
+                    'OPEN' if self.eye_state_history[-1]['eyes_open']
+                    else 'CLOSED'
+                )
+            else:
+                eye_status = 'UNKNOWN'
         
         info_text = [
             f"Status: {status}",
@@ -350,8 +385,11 @@ class AdvancedGazeTracker:
     
     def get_movement_statistics(self):
         """Получение статистики движений"""
-        movement_count = len(self.movement_events)
-        total_frames = self.frame_count
+        with self._data_lock:
+            movement_count = len(self.movement_events)
+            total_frames = self.frame_count
+            movements = list(self.movement_events)
+            eye_states = list(self.eye_state_history)
         
         if total_frames == 0:
             return {
@@ -362,12 +400,14 @@ class AdvancedGazeTracker:
             }
         
         # Вычисляем среднюю величину движения
-        magnitudes = [event['movement_magnitude'] for event in self.movement_events]
+        magnitudes = [event['movement_magnitude'] for event in movements]
         avg_magnitude = np.mean(magnitudes) if magnitudes else 0.0
         
         # Качество данных (процент кадров с открытыми глазами)
-        valid_eye_states = [state for state in self.eye_state_history if state['eyes_open']]
-        data_quality = (len(valid_eye_states) / len(self.eye_state_history)) * 100 if self.eye_state_history else 0.0
+        valid_eye_states = [state for state in eye_states if state['eyes_open']]
+        data_quality = (
+            (len(valid_eye_states) / len(eye_states)) * 100 if eye_states else 0.0
+        )
         
         return {
             'movement_count': movement_count,
@@ -376,6 +416,17 @@ class AdvancedGazeTracker:
             'avg_movement_magnitude': avg_magnitude,
             'total_frames': total_frames
         }
+
+    def reset_tracking_data(self):
+        """Потокобезопасно сбрасывает накопленные данные взгляда."""
+        with self._data_lock:
+            self.movement_events.clear()
+            self.gaze_history.clear()
+            self.eye_state_history.clear()
+            self.consecutive_still_frames = 0
+            self.last_movement_time = 0
+            self.last_valid_gaze = None
+            self.frame_count = 0
 
 
 class MovementBasedCryptoGenerator:
@@ -387,17 +438,61 @@ class MovementBasedCryptoGenerator:
     def __init__(self, tracker):
         self.tracker = tracker
         self.entropy_pool = deque(maxlen=1000)
+        self._consumed_movement_count = 0
+
+    def reset(self):
+        """Сбрасывает отметку уже использованных событий движения."""
+        with self.tracker._data_lock:
+            self._consumed_movement_count = 0
+
+    def available_movement_count(self) -> int:
+        """Возвращает число новых движений, не использованных для ключа."""
+        with self.tracker._data_lock:
+            return max(
+                0,
+                len(self.tracker.movement_events) - self._consumed_movement_count
+            )
+
+    def _movement_snapshot(self) -> Tuple[List[Dict[str, Any]], int]:
+        """Возвращает стабильный снимок новых движений и конечный индекс."""
+        with self.tracker._data_lock:
+            events = list(self.tracker.movement_events)
+            start = min(self._consumed_movement_count, len(events))
+            return events[start:], len(events)
+
+    def consume_entropy_until(self, movement_count: int):
+        """Помечает движения до movement_count как использованные."""
+        with self.tracker._data_lock:
+            movement_count = max(
+                0, min(movement_count, len(self.tracker.movement_events))
+            )
+            self._consumed_movement_count = max(
+                self._consumed_movement_count, movement_count
+            )
+
+    def get_available_entropy_snapshot(self) -> Tuple[bytes, int, int]:
+        """
+        Возвращает сырые байты из новых движений, конечный индекс снимка
+        и количество движений в этом снимке. Пул не очищается.
+        """
+        movements, end_index = self._movement_snapshot()
+        bits = self._extract_movement_entropy(movements)
+        return self._bits_to_bytes(bits), end_index, len(movements)
         
     def extract_movement_entropy(self):
         """Извлечение энтропии из движений глаз"""
-        if len(self.tracker.movement_events) < 5:
+        with self.tracker._data_lock:
+            movements = list(self.tracker.movement_events)
+        return self._extract_movement_entropy(movements)
+
+    def _extract_movement_entropy(self, movements: List[Dict[str, Any]]) -> List[int]:
+        """Извлечение энтропии из переданного набора движений глаз."""
+        if len(movements) < 5:
             return []
         
-        # Берем последние движения
-        recent_movements = list(self.tracker.movement_events)[-10:]
         bits = []
         
-        for movement in self.tracker.movement_events:
+        for movement in movements:
             # Извлекаем энтропию из различных параметров движения
             movement_bits = self._extract_movement_bits(movement)
             timing_bits = self._extract_timing_bits(movement)
@@ -458,71 +553,60 @@ class MovementBasedCryptoGenerator:
         
         bits.extend(openness_bits + attention_bits)
         return bits
+
+    @staticmethod
+    def _bits_to_bytes(bits: List[int]) -> bytes:
+        """Преобразование битового массива в байты с padding последнего байта."""
+        byte_array = bytearray()
+
+        for i in range(0, len(bits), 8):
+            chunk = bits[i:i + 8]
+            if len(chunk) < 8:
+                chunk = chunk + [0] * (8 - len(chunk))
+
+            byte_array.append(int(''.join(map(str, chunk)), 2))
+
+        return bytes(byte_array)
     
     def generate_secure_bits(self, num_bits=256):
         """Генерация безопасных битов"""
-        movement_count = len(self.tracker.movement_events)
+        key_material, end_index, movement_count = self.get_available_entropy_snapshot()
         
-        if movement_count < 20:
-            print(f" Недостаточно движений: {movement_count}/20")
+        if movement_count < MIN_EYE_MOVEMENTS_PER_KEY:
+            print(f" Недостаточно новых движений: {movement_count}/{MIN_EYE_MOVEMENTS_PER_KEY}")
             return []
         
         print(f" Генерация {num_bits} битов из {movement_count} движений...")
         
-        bits = []
-        attempts = 0
-        max_attempts = 50
-        byte_to_gen_key = bytearray()  
-        while len(bits) < num_bits and attempts < max_attempts:
-            new_bits = self.extract_movement_entropy()
-            if new_bits:
-                bits.extend(new_bits)
-        
-            attempts += 1
-        
-            if len(bits) < num_bits:
-                time.sleep(0.1)
+        if len(key_material) * 8 < num_bits:
+            print(f" Не удалось собрать достаточно битов: {len(key_material) * 8}/{num_bits}")
+            return []
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = f"D:/university/Coursework sem 7/row_bites/newbits_data_{timestamp}.bin"    
-        with open(filepath, "wb") as f:
-            # Записываем все биты как байты
-            for i in range(0, len(bits), 8):
-                chunk = bits[i:i+8]
-                if len(chunk) == 8:
-                    byte_value = int(''.join(map(str, chunk)), 2)
-                    f.write(bytes([byte_value]))
-                else:
-                    # Дополняем последний неполный байт нулями
-                    incomplete_byte = chunk + [0] * (8 - len(chunk))
-                    byte_value = int(''.join(map(str, incomplete_byte)), 2)
-                    byte_to_gen_key.append(byte_value)
-                    f.write(byte_to_gen_key)
+        min_bytes = min_pool_bytes_for_key(num_bits)
+        if len(key_material) < min_bytes:
+            print(
+                f" Недостаточно свежего пула: {len(key_material)}/{min_bytes} байт"
+            )
+            return []
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filepath = Path.cwd() / f"newbits_data_{timestamp}.bin"
+        filepath.write_bytes(key_material)
+        print(f" Сырые биты сохранены: {filepath}")
         
-        sha256_hash = hashlib.sha256(byte_to_gen_key).digest()
+        sha256_hash = hashlib.sha256(key_material).digest()
         num_bytes = num_bits // 8
         final_key = sha256_hash[:num_bytes]
+        self.consume_entropy_until(end_index)
         
         return final_key
     
-    # def bits_to_bytes(self, bits):
-    #     """Преобразование битов в байты"""
-    #     if len(bits) % 8 != 0:
-    #         bits = bits[:-(len(bits) % 8)]  # Обрезаем до кратного 8
-        
-    #     byte_array = bytearray()
-    #     for i in range(0, len(bits), 8):
-    #         byte_bits = bits[i:i+8]
-    #         byte_value = int(''.join(map(str, byte_bits)), 2)
-    #         byte_array.append(byte_value)
-        
-    #     return bytes(byte_array)
-
 
 def main():
     """Основная функция улучшенного трекера"""
     if not MEDIAPIPE_AVAILABLE:
-        print(" MediaPipe не установлен. Установите: pip install mediapipe")
+        print(f" MediaPipe недоступен: {MEDIAPIPE_IMPORT_ERROR}")
+        print(" Установите зависимости из requirements.txt под Python 3.10-3.12")
         return
     
     # Инициализация
@@ -593,11 +677,8 @@ def main():
                 else:
                     print(f" Не удалось сгенерировать ключ (256 бит)")
             elif key == ord('r'):
-                tracker.movement_events.clear()
-                tracker.gaze_history.clear()
-                tracker.eye_state_history.clear()
-                tracker.consecutive_still_frames = 0
-                tracker.last_movement_time = 0
+                tracker.reset_tracking_data()
+                crypto_generator.reset()
                 print(" Данные сброшены")
     
     except KeyboardInterrupt:
