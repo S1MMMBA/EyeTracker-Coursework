@@ -799,7 +799,8 @@ class TripleToggle(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pos   = 1          # текущее положение (0/1/2), по умолчанию «Оба»
-        self._anim  = 0.0        # анимированная позиция рукоятки 0.0–2.0
+        # Анимированная позиция рукоятки 0.0–2.0.
+        self._anim  = float(self._pos)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(280, 52)
